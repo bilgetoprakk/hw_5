@@ -1,0 +1,595 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# IE 440 - HW5
+# Part 1: Steepest Descent + Golden Section (with scaling)
+# Part 2: One-hidden-layer MLP
+# ============================================================
+
+# ------------------------------------------------------------
+# Load data and train/test split
+# ------------------------------------------------------------
+# IMPORTANT: fix this path according to your machine
+data = np.loadtxt("regression_data.dat")
+
+x_all = data[:, 0]
+y_all = data[:, 1]
+N = len(x_all)
+
+rng = np.random.default_rng(0)
+perm = rng.permutation(N)
+x_all = x_all[perm]
+y_all = y_all[perm]
+
+N_train = int(0.8 * N)
+x_train = x_all[:N_train]
+y_train = y_all[:N_train]
+x_test  = x_all[N_train:]
+y_test  = y_all[N_train:]
+N_test  = len(x_test)
+
+print(f"N_train = {N_train}, N_test = {N_test}")
+
+
+# ------------------------------------------------------------
+# Helper: SSE, Test MSE, variance of squared errors
+# ------------------------------------------------------------
+def regression_metrics(y_true, y_pred):
+    """
+    Compute SSE, MSE, and variance of squared errors.
+
+    e_i = y_i - O_i
+    SSE = sum e_i^2
+    MSE = (1/N) sum e_i^2
+    s^2 = var(e_i^2), with ddof=1
+    """
+    errors = y_true - y_pred
+    sq = errors ** 2
+    sse = np.sum(sq)
+    mse = np.mean(sq)
+    var = np.var(sq, ddof=1)
+    return sse, mse, var
+
+
+# ============================================================
+# Golden Section Search (for line search)
+# ============================================================
+def golden_section_search(phi, a=0.0, b=1.0, tol=1e-6, max_iter=100):
+    """
+    Golden Section Search for exact line search.
+
+    We work in a scaled space (z, t), so [0, 1] is safe.
+    """
+    tau = 0.618
+
+    x1 = b - tau * (b - a)
+    x2 = a + tau * (b - a)
+    f1 = phi(x1)
+    f2 = phi(x2)
+
+    for _ in range(max_iter):
+        if not np.isfinite(f1):
+            f1 = 1e30
+        if not np.isfinite(f2):
+            f2 = 1e30
+
+        if abs(b - a) < tol:
+            break
+
+        if f1 < f2:
+            b = x2
+            x2 = x1
+            f2 = f1
+            x1 = b - tau * (b - a)
+            f1 = phi(x1)
+        else:
+            a = x1
+            x1 = x2
+            f1 = f2
+            x2 = a + tau * (b - a)
+            f2 = phi(x2)
+
+    alpha_star = 0.5 * (a + b)
+    if not np.isfinite(alpha_star):
+        alpha_star = 0.0
+    return alpha_star
+
+
+# ============================================================
+# Generic Steepest Descent + Golden Section (in scaled space)
+# ============================================================
+def steepest_descent(f, grad_f, w0,
+                     eps_grad=1e-4, eps_step=1e-6,
+                     max_iter=2000):
+    """
+    Steepest Descent with Golden Section exact line search.
+
+    f(w): objective (SSE in scaled variables)
+    grad_f(w): gradient of f
+    """
+    w = w0.astype(float)
+
+    for k in range(max_iter):
+        g = grad_f(w)
+        g_norm = np.linalg.norm(g)
+
+        if g_norm < eps_grad:
+            break
+
+        d = -g  # steepest descent direction
+
+        # 1D function phi(alpha) = f(w + alpha d)
+        def phi(alpha):
+            w_trial = w + alpha * d
+            val = f(w_trial)
+            if not np.isfinite(val):
+                return 1e30
+            return val
+
+        alpha = golden_section_search(phi, a=0.0, b=1.0)
+
+        w_new = w + alpha * d
+        step_norm = np.linalg.norm(w_new - w)
+        w = w_new
+
+        if step_norm < eps_step:
+            break
+
+    return w
+
+
+# ============================================================
+# 1(a) Linear regression: y = w1 x + w0
+#    -> do SD+GS in scaled space (z, t), then map back to (w0, w1)
+# ============================================================
+def solve_linear_regression():
+    # scale x and y for numerical stability
+    xm = x_train.mean()
+    xs = x_train.std()
+    ym = y_train.mean()
+    ys = y_train.std()
+
+    z_train = (x_train - xm) / xs
+    z_test  = (x_test  - xm) / xs
+    t_train = (y_train - ym) / ys
+    t_test  = (y_test  - ym) / ys
+
+    # linear model in scaled space: t ≈ a0 + a1 z
+    def lin_sse_scaled(a):
+        a0, a1 = a
+        t_hat = a0 + a1 * z_train
+        return np.sum((t_train - t_hat) ** 2)
+
+    def lin_grad_scaled(a):
+        a0, a1 = a
+        t_hat = a0 + a1 * z_train
+        e = t_train - t_hat
+        d_a0 = -2.0 * np.sum(e)
+        d_a1 = -2.0 * np.sum(e * z_train)
+        return np.array([d_a0, d_a1])
+
+    a_init = np.array([0.0, 0.0])
+    a_star = steepest_descent(lin_sse_scaled, lin_grad_scaled, a_init)
+
+    # map back to original coefficients w0, w1
+    a0, a1 = a_star
+    # t = a0 + a1*z,  z = (x - xm)/xs
+    # y = ym + ys * t = ym + ys*(a0 - a1*xm/xs) + ys*(a1/xs)*x
+    w1 = ys * (a1 / xs)
+    w0 = ym + ys * (a0 - a1 * xm / xs)
+    w_star = np.array([w0, w1])
+
+    # predictions in original space
+    y_train_hat = w0 + w1 * x_train
+    y_test_hat  = w0 + w1 * x_test
+
+    train_sse, _, _ = regression_metrics(y_train, y_train_hat)
+    _, test_mse, test_var = regression_metrics(y_test, y_test_hat)
+
+    print("\n=== 1(a) Linear regression (y = w1 x + w0) ===")
+    print("w* =", w_star)
+    print("Training SSE =", train_sse)
+    print("Test MSE     =", test_mse)
+    print("s^2 (Test)   =", test_var)
+
+    xs_plot = np.linspace(x_all.min(), x_all.max(), 200)
+    ys_plot = w0 + w1 * xs_plot
+
+    plt.figure()
+    plt.scatter(x_train, y_train, label="Train", alpha=0.6)
+    plt.scatter(x_test,  y_test,  label="Test",  alpha=0.6)
+    plt.plot(xs_plot, ys_plot, label="Linear fit", linewidth=2)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title("1(a) Linear regression (SD + Golden Section)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return {
+        "w": w_star,
+        "train_SSE": train_sse,
+        "test_MSE": test_mse,
+        "test_var": test_var
+    }
+
+
+# ============================================================
+# 1(b) Quadratic regression: y = w2 x^2 + w1 x + w0
+#    -> SD+GS in scaled space t ≈ b0 + b1 z + b2 z^2, then map
+# ============================================================
+def solve_quadratic_regression():
+    xm = x_train.mean()
+    xs = x_train.std()
+    ym = y_train.mean()
+    ys = y_train.std()
+
+    z_train = (x_train - xm) / xs
+    z_test  = (x_test  - xm) / xs
+    t_train = (y_train - ym) / ys
+    t_test  = (y_test  - ym) / ys
+
+    # quadratic model in scaled space: t ≈ b0 + b1 z + b2 z^2
+    def quad_sse_scaled(b):
+        b0, b1, b2 = b
+        t_hat = b0 + b1 * z_train + b2 * (z_train ** 2)
+        return np.sum((t_train - t_hat) ** 2)
+
+    def quad_grad_scaled(b):
+        b0, b1, b2 = b
+        t_hat = b0 + b1 * z_train + b2 * (z_train ** 2)
+        e = t_train - t_hat
+        d_b0 = -2.0 * np.sum(e)
+        d_b1 = -2.0 * np.sum(e * z_train)
+        d_b2 = -2.0 * np.sum(e * (z_train ** 2))
+        return np.array([d_b0, d_b1, d_b2])
+
+    b_init = np.array([0.0, 0.0, 0.0])
+    b_star = steepest_descent(quad_sse_scaled, quad_grad_scaled, b_init)
+
+    b0, b1, b2 = b_star
+    # algebra to map (b0,b1,b2) in z-space to (w0,w1,w2) in x-space:
+    # z = (x - xm)/xs
+    # t = b0 + b1 z + b2 z^2
+    # z^2 = (x^2 - 2 xm x + xm^2)/xs^2
+    # => t = c0 + c1 x + c2 x^2
+    c2 = b2 / (xs ** 2)
+    c1 = (b1 / xs) - (2 * b2 * xm / (xs ** 2))
+    c0 = b0 - (b1 * xm / xs) + (b2 * xm * 2 / (xs * 2))
+    # y = ym + ys * t = (ym + ys*c0) + ys*c1*x + ys*c2*x^2
+    w2 = ys * c2
+    w1 = ys * c1
+    w0 = ym + ys * c0
+    w_star = np.array([w0, w1, w2])
+
+    y_train_hat = w0 + w1 * x_train + w2 * (x_train ** 2)
+    y_test_hat  = w0 + w1 * x_test  + w2 * (x_test  ** 2)
+
+    train_sse, _, _ = regression_metrics(y_train, y_train_hat)
+    _, test_mse, test_var = regression_metrics(y_test, y_test_hat)
+
+    print("\n=== 1(b) Quadratic regression (y = w2 x^2 + w1 x + w0) ===")
+    print("w* =", w_star)
+    print("Training SSE =", train_sse)
+    print("Test MSE     =", test_mse)
+    print("s^2 (Test)   =", test_var)
+
+    xs_plot = np.linspace(x_all.min(), x_all.max(), 200)
+    ys_plot = w0 + w1 * xs_plot + w2 * (xs_plot ** 2)
+
+    plt.figure()
+    plt.scatter(x_train, y_train, label="Train", alpha=0.6)
+    plt.scatter(x_test,  y_test,  label="Test",  alpha=0.6)
+    plt.plot(xs_plot, ys_plot, label="Quadratic fit", linewidth=2)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title("1(b) Quadratic regression (SD + Golden Section)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return {
+        "w": w_star,
+        "train_SSE": train_sse,
+        "test_MSE": test_mse,
+        "test_var": test_var
+    }
+
+
+# ============================================================
+# 2. One-hidden-layer MLP (same mantık, test MSE + var)
+# ============================================================
+def sigmoid(h):
+    h = np.clip(h, -50, 50)
+    return 1.0 / (1.0 + np.exp(-h))
+
+
+def sigmoid_prime(h):
+    s = sigmoid(h)
+    return s * (1.0 - s)
+
+
+# ============================================================
+# 2. One-hidden-layer MLP (Algorithm 2: Stochastic Gradient Descent)
+# ============================================================
+class OneHiddenMLP:
+    """
+    One-hidden-layer MLP for regression.
+    Hidden: sigmoid, Output: linear.
+    Algorithm: Stochastic Online Gradient Descent (Algorithm 2)
+    """
+
+    # DÜZELTME: init değil _init_ (ikişer alt çizgi)
+    def _init_(self, n_inputs, n_hidden,
+                 alpha0=0.5, eta=0.9, eps=1e-3,
+                 max_epochs=2000, rng=None):
+        self.n_inputs = n_inputs
+        self.n_hidden = n_hidden
+        self.alpha0 = alpha0
+        self.eta = eta
+        self.eps = eps
+        self.max_epochs = max_epochs
+        # Random generator
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+        # Ağırlık başlatma (Random)
+        self.W0 = self.rng.uniform(-0.1, 0.1, size=(n_hidden, n_inputs + 1))
+        self.W1 = self.rng.uniform(-0.1, 0.1, size=(n_hidden + 1,))
+        
+        # Anlık alpha değeri
+        self.alpha = self.alpha0
+
+    def _forward(self, X):
+        # X shape: (N, n_inputs) -> Stochastic modda N=1 olacak
+        N = X.shape[0]
+        Xb = np.hstack([-np.ones((N, 1)), X])        # (N, n_inputs+1)
+        h = Xb @ self.W0.T                           # (N, n_hidden)
+        H = sigmoid(h)                               # (N, n_hidden)
+        Hb = np.hstack([-np.ones((N, 1)), H])        # (N, n_hidden+1)
+        o_in = Hb @ self.W1                          # (N,)
+        O = o_in                                     # linear output
+        return Xb, h, H, Hb, o_in, O
+
+    def predict(self, X):
+        _, _, _, _, _, O = self._forward(X)
+        return O
+
+    def fit(self, X, y):
+        """
+        Algorithm 2: STOCHASTIC ONLINE GRADIENT DESCENT
+        Her veri satırı için ağırlıklar anında güncellenir.
+        """
+        N = X.shape[0]
+        epoch = 0
+        self.alpha = self.alpha0 # Her fit çağrısında alpha'yı resetle
+        
+        # Karıştırma için indeks listesi
+        indices = np.arange(N)
+
+        while self.alpha > self.eps and epoch < self.max_epochs:
+            
+            # 1. Veri sırasını karıştır (Randomize Order)
+            self.rng.shuffle(indices)
+            X_shuffled = X[indices]
+            y_shuffled = y[indices]
+
+            # 2. Her bir veri noktası için döngü (Online Mode)
+            for i in range(N):
+                # Tek bir örnek al
+                Xi = X_shuffled[i:i+1]  # (1, n_inputs)
+                yi = y_shuffled[i:i+1]  # (1,)
+
+                # --- Forward Pass ---
+                Xb, h, H, Hb, o_in, O = self._forward(Xi)
+
+                # --- Hata Hesabı ---
+                # Online modda N'e bölmeyiz, direkt o anki hatayı kullanırız
+                delta_out = (O - yi) 
+
+                # --- Backward Pass ---
+                grad_W1 = Hb.T @ delta_out
+
+                tmp = delta_out[:, None] * self.W1[1:][None, :]
+                delta_hidden = sigmoid_prime(h) * tmp
+                grad_W0 = delta_hidden.T @ Xb
+
+                # --- GÜNCELLEME (Algorithm 2: Döngü içinde anlık güncelleme) ---
+                self.W1 -= self.alpha * grad_W1
+                self.W0 -= self.alpha * grad_W0
+
+            # Learning rate decay (Epoch sonunda yapılır)
+            self.alpha *= self.eta
+            epoch += 1
+
+
+def train_mlp_and_select_hidden(X_train, y_train_s,
+                                X_test, y_test_s,
+                                n_inputs,
+                                J0=3, alpha0=0.5, eta=0.9, eps=1e-3,
+                                max_hidden=20):
+    rng = np.random.default_rng(123)
+    J = J0
+    best_J = J
+    best_test_mse = np.inf
+    best_model = None
+    
+    # Stochastic yöntem daha gürültülü ama hızlıdır. 
+    # J arttıkça performansın iyileşip sonra kötüleştiğini (overfitting) göreceksin.
+
+    while J <= max_hidden:
+        print(f"\nTraining MLP (Stochastic) with J = {J} hidden units...")
+        model = OneHiddenMLP(n_inputs, J,
+                             alpha0=alpha0, eta=eta, eps=eps,
+                             max_epochs=2000, rng=rng)
+        model.fit(X_train, y_train_s)
+
+        y_train_hat_s = model.predict(X_train)
+        y_test_hat_s  = model.predict(X_test)
+
+        train_sse_s = np.sum((y_train_s - y_train_hat_s) ** 2)
+        test_mse_s  = np.mean((y_test_s  - y_test_hat_s)  ** 2)
+
+        print(f"J = {J}: Train SSE (scaled) = {train_sse_s:.4f}, "
+              f"Test MSE (scaled) = {test_mse_s:.4f}")
+
+        if test_mse_s < best_test_mse:
+            best_test_mse = test_mse_s
+            best_J = J
+            best_model = model
+            J += 1
+        else:
+            print("Test error increased. Stopping.")
+            break
+
+    print(f"\nSelected number of hidden units: J = {best_J}")
+    return best_J, best_model
+
+# ------------------------------------------------------------
+# 2(a) MLP with input x (standardized)
+# ------------------------------------------------------------
+def solve_mlp_case_a():
+    x_mean = x_train.mean()
+    x_std  = x_train.std()
+    z_train = (x_train - x_mean) / x_std
+    z_test  = (x_test  - x_mean) / x_std
+
+    y_mean = y_train.mean()
+    y_std  = y_train.std()
+    y_train_s = (y_train - y_mean) / y_std
+    y_test_s  = (y_test  - y_mean) / y_std
+
+    Xtr = z_train.reshape(-1, 1)
+    Xte = z_test.reshape(-1, 1)
+
+    best_J, best_model = train_mlp_and_select_hidden(
+        Xtr, y_train_s, Xte, y_test_s,
+        n_inputs=1,
+        J0=3, alpha0=0.5, eta=0.9, eps=1e-3,
+        max_hidden=15
+    )
+
+    y_train_hat_s = best_model.predict(Xtr)
+    y_test_hat_s  = best_model.predict(Xte)
+
+    y_train_hat = y_mean + y_std * y_train_hat_s
+    y_test_hat  = y_mean + y_std * y_test_hat_s
+
+    train_sse, _, _ = regression_metrics(y_train, y_train_hat)
+    _, test_mse, test_var = regression_metrics(y_test, y_test_hat)
+
+    print("\n=== 2(a) MLP regression (1 input: x) ===")
+    print(f"Chosen J = {best_J}")
+    print("Training SSE =", train_sse)
+    print("Test MSE     =", test_mse)
+    print("s^2 (Test)   =", test_var)
+
+    xs = np.linspace(x_all.min(), x_all.max(), 200)
+    zs = (xs - x_mean) / x_std
+    Xs = zs.reshape(-1, 1)
+    ys_hat_s = best_model.predict(Xs)
+    ys_hat   = y_mean + y_std * ys_hat_s
+
+    plt.figure()
+    plt.scatter(x_train, y_train, label="Train", alpha=0.6)
+    plt.scatter(x_test,  y_test,  label="Test",  alpha=0.6)
+    plt.plot(xs, ys_hat, label=f"MLP 2(a), J={best_J}", linewidth=2)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title("2(a) MLP regression (input = standardized x)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return {
+        "J": best_J,
+        "train_SSE": train_sse,
+        "test_MSE": test_mse,
+        "test_var": test_var
+    }
+
+
+# ------------------------------------------------------------
+# 2(b) MLP with inputs (x, x^2) (standardized)
+# ------------------------------------------------------------
+def solve_mlp_case_b():
+    x_mean = x_train.mean()
+    x_std  = x_train.std()
+    z_train = (x_train - x_mean) / x_std
+    z_test  = (x_test  - x_mean) / x_std
+
+    y_mean = y_train.mean()
+    y_std  = y_train.std()
+    y_train_s = (y_train - y_mean) / y_std
+    y_test_s  = (y_test  - y_mean) / y_std
+
+    Xtr = np.column_stack([z_train, z_train**2])
+    Xte = np.column_stack([z_test,  z_test**2])
+
+    best_J, best_model = train_mlp_and_select_hidden(
+        Xtr, y_train_s, Xte, y_test_s,
+        n_inputs=2,
+        J0=3, alpha0=0.5, eta=0.9, eps=1e-3,
+        max_hidden=15
+    )
+
+    y_train_hat_s = best_model.predict(Xtr)
+    y_test_hat_s  = best_model.predict(Xte)
+
+    y_train_hat = y_mean + y_std * y_train_hat_s
+    y_test_hat  = y_mean + y_std * y_test_hat_s
+
+    train_sse, _, _ = regression_metrics(y_train, y_train_hat)
+    _, test_mse, test_var = regression_metrics(y_test, y_test_hat)
+
+    print("\n=== 2(b) MLP regression (2 inputs: x, x^2) ===")
+    print(f"Chosen J = {best_J}")
+    print("Training SSE =", train_sse)
+    print("Test MSE     =", test_mse)
+    print("s^2 (Test)   =", test_var)
+
+    xs = np.linspace(x_all.min(), x_all.max(), 200)
+    zs = (xs - x_mean) / x_std
+    Xs = np.column_stack([zs, zs**2])
+    ys_hat_s = best_model.predict(Xs)
+    ys_hat   = y_mean + y_std * ys_hat_s
+
+    plt.figure()
+    plt.scatter(x_train, y_train, label="Train", alpha=0.6)
+    plt.scatter(x_test,  y_test,  label="Test",  alpha=0.6)
+    plt.plot(xs, ys_hat, label=f"MLP 2(b), J={best_J}", linewidth=2)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title("2(b) MLP regression (inputs = standardized x, x^2)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return {
+        "J": best_J,
+        "train_SSE": train_sse,
+        "test_MSE": test_mse,
+        "test_var": test_var
+    }
+
+
+# ============================================================
+# Main: run everything and print summary table
+# ============================================================
+if _name_ == "_main_":
+    res_1a = solve_linear_regression()
+    res_1b = solve_quadratic_regression()
+    res_2a = solve_mlp_case_a()
+    res_2b = solve_mlp_case_b()
+
+    print("\n===== SUMMARY TABLE =====")
+    print("Method    | Train SSE         | Test MSE          | s^2 (Test MSE)")
+    print("-----------------------------------------------------------------")
+    print(f"1(a) lin  | {res_1a['train_SSE']:<17.6f} | "
+          f"{res_1a['test_MSE']:<17.6f} | {res_1a['test_var']:<.6f}")
+    print(f"1(b) quad | {res_1b['train_SSE']:<17.6f} | "
+          f"{res_1b['test_MSE']:<17.6f} | {res_1b['test_var']:<.6f}")
+    print(f"2(a) MLP  | {res_2a['train_SSE']:<17.6f} | "
+          f"{res_2a['test_MSE']:<17.6f} | {res_2a['test_var']:<.6f}")
+    print(f"2(b) MLP  | {res_2b['train_SSE']:<17.6f} | "
+          f"{res_2b['test_MSE']:<17.6f} | {res_2b['test_var']:<.6f}")
